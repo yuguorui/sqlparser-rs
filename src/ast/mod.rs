@@ -136,6 +136,11 @@ impl fmt::Display for Ident {
         }
     }
 }
+impl PartialEq<str> for Ident {
+    fn eq(&self, other: &str) -> bool {
+        self.value == other
+    }
+}
 
 /// A name of a table, view, custom type, etc., possibly multi-part, i.e. db.schema.obj
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

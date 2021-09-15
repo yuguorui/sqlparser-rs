@@ -16,7 +16,6 @@
 // If, over time, we convert these large variants to dedicated structs, we
 // can remove this escape hatch.
 #![allow(clippy::too_many_arguments)]
-
 // Disable lints that want us to rewrite `&Ident` as `&str`, as `&str` is not as
 // self-documenting as &Ident.
 #![allow(clippy::ptr_arg)]
@@ -62,7 +61,7 @@ pub trait Visit<'ast> {
         &mut self,
         name: &'ast ObjectName,
         alias: Option<&'ast TableAlias>,
-        args: &'ast [Expr],
+        args: &'ast [FunctionArg],
         with_hints: &'ast [Expr],
     ) {
         visit_table_table_factor(self, name, alias, args, with_hints)
@@ -260,8 +259,9 @@ pub trait Visit<'ast> {
         table_name: &'ast ObjectName,
         columns: &'ast [Ident],
         source: &'ast Query,
+        partitioned: &'ast Option<Vec<Expr>>
     ) {
-        visit_insert(self, table_name, columns, source)
+        visit_insert(self, table_name, columns, source, partitioned)
     }
 
     fn visit_values(&mut self, values: &'ast Values) {
@@ -326,6 +326,7 @@ pub trait Visit<'ast> {
         external: bool,
         file_format: &'ast Option<FileFormat>,
         location: &'ast Option<String>,
+        query: &'ast Option<Box<Query>>
     ) {
         visit_create_table(
             self,
@@ -336,6 +337,7 @@ pub trait Visit<'ast> {
             external,
             file_format,
             location,
+            query,
         )
     }
 
@@ -412,6 +414,55 @@ pub trait Visit<'ast> {
         visit_alter_drop_constraint(self, name)
     }
 
+    fn visit_alter_add_column(&mut self, column_def: &'ast ColumnDef) {
+        visit_alter_add_column(self, column_def)
+    }
+
+    fn visit_alter_drop_column(
+        &mut self,
+        column_name: &'ast Ident,
+        if_exists: &bool,
+        cascade: &bool,
+    ) {
+        visit_alter_drop_column(self, column_name, if_exists, cascade);
+    }
+
+    fn visit_alter_rename_column(
+        &mut self,
+        old_column_name: &'ast Ident,
+        new_column_name: &'ast Ident,
+    ) {
+        visit_alter_rename_column(self, old_column_name, new_column_name);
+    }
+
+    fn visit_partitions(&mut self, partitions: &'ast Vec<Expr>) {
+        visit_partitions(self, partitions);
+    }
+
+    fn visit_alter_rename_partitions(
+        &mut self,
+        old_partitions: &'ast Vec<Expr>,
+        new_partitions: &'ast Vec<Expr>,
+    ) {
+        visit_alter_rename_partitions(self, old_partitions, new_partitions);
+    }
+
+    fn visit_alter_add_partitions(
+        &mut self,
+        if_not_exists: &'ast bool,
+        new_partitions: &'ast Vec<Expr>,
+    ) {
+        visit_alter_add_partitions(self, if_not_exists, new_partitions);
+    }
+
+    fn visit_alter_drop_partitions(&mut self, if_exists: &'ast bool, partitions: &'ast Vec<Expr>) {
+        visit_alter_drop_partitions(self, if_exists, partitions);
+    }
+
+    fn visit_alter_rename_table(&mut self, table_name: &'ast ObjectName) {
+        visit_alter_rename_table(self, table_name);
+    }
+
     fn visit_start_transaction(&mut self, modes: &'ast [TransactionMode]) {
         visit_start_transaction(self, modes)
     }
@@ -430,7 +481,6 @@ pub trait Visit<'ast> {
         &mut self,
         _isolation_level: &'ast TransactionIsolationLevel,
     ) {
-
     }
 
     fn visit_commit(&mut self, _chain: bool) {}
@@ -440,12 +490,38 @@ pub trait Visit<'ast> {
 
 pub fn visit_statement<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, statement: &'ast Statement) {
     match statement {
+        Statement::ShowCreate { .. } => {}
+        Statement::ShowColumns { .. } => {}
+        Statement::CreateSchema { .. } => {}
+        Statement::CreateDatabase { .. } => {}
+        Statement::Assert { condition, message } => {
+            visitor.visit_expr(condition);
+            if let Some(message) = message {
+                visitor.visit_expr(message);
+            }
+        }
+        // PostgreSQL
+        Statement::Deallocate { .. } => {}
+        Statement::Execute { name, parameters } => {
+            visitor.visit_ident(name);
+            for expr in parameters {
+                visitor.visit_expr(expr);
+            }
+        }
+        Statement::Prepare { .. } => {}
+
+        // MySQL
+        Statement::ExplainTable { .. } => {}
+
+        Statement::Explain { statement, .. } => visitor.visit_statement(statement),
         Statement::Query(query) => visitor.visit_query(query),
         Statement::Insert {
             table_name,
             columns,
             source,
-        } => visitor.visit_insert(table_name, columns, source),
+            partitioned,
+            ..
+        } => visitor.visit_insert(table_name, columns, source, partitioned),
         Statement::Copy {
             table_name,
             columns,
@@ -466,12 +542,14 @@ pub fn visit_statement<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, statement
             query,
             materialized,
             with_options,
+            ..
         } => visitor.visit_create_view(name, columns, query, *materialized, with_options),
         Statement::Drop {
             object_type,
             if_exists,
             names,
             cascade,
+            ..
         } => visitor.visit_drop(object_type, *if_exists, names, *cascade),
         Statement::CreateTable {
             name,
@@ -481,6 +559,8 @@ pub fn visit_statement<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, statement
             with_options,
             file_format,
             location,
+            query,
+            ..
         } => visitor.visit_create_table(
             name,
             columns,
@@ -489,19 +569,33 @@ pub fn visit_statement<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, statement
             *external,
             file_format,
             location,
+            query,
         ),
         Statement::AlterTable { name, operation } => visitor.visit_alter_table(name, operation),
         Statement::StartTransaction { modes } => visitor.visit_start_transaction(modes),
         Statement::SetTransaction { modes } => visitor.visit_set_transaction(modes),
         Statement::Commit { chain } => visitor.visit_commit(*chain),
         Statement::Rollback { chain } => visitor.visit_rollback(*chain),
+        Statement::Directory { source, .. } => visitor.visit_query(source),
+        // HIVE
+        Statement::Analyze { .. } => {}
+        Statement::Truncate { .. } => {}
+        Statement::Msck { .. } => {}
+        // Not implemented
+        Statement::CreateVirtualTable { .. } => {}
+        Statement::CreateIndex { .. } => {}
+        Statement::SetVariable { .. } => {}
+        Statement::ShowVariable { .. } => {}
     }
 }
 
 pub fn visit_query<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, query: &'ast Query) {
-    for cte in &query.ctes {
-        visitor.visit_cte(cte);
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            visitor.visit_cte(cte);
+        }
     }
+
     visitor.visit_set_expr(&query.body);
     for order_by in &query.order_by {
         visitor.visit_order_by(order_by);
@@ -568,7 +662,7 @@ pub fn visit_table_factor<'ast, V: Visit<'ast> + ?Sized>(
             alias,
             args,
             with_hints,
-        } => visitor.visit_table_table_factor(name, alias.as_ref(), args, with_hints),
+        } => visitor.visit_table_table_factor(name, alias.as_ref(), args.as_slice(), with_hints),
         TableFactor::Derived {
             lateral,
             subquery,
@@ -577,6 +671,10 @@ pub fn visit_table_factor<'ast, V: Visit<'ast> + ?Sized>(
         TableFactor::NestedJoin(table_with_joins) => {
             visitor.visit_nested_join_table_factor(table_with_joins)
         }
+        TableFactor::TableFunction { expr, alias } => match alias {
+            Some(alias) => visitor.visit_table_alias(alias),
+            None => visitor.visit_expr(expr),
+        },
     }
 }
 
@@ -584,11 +682,15 @@ pub fn visit_table_table_factor<'ast, V: Visit<'ast> + ?Sized>(
     visitor: &mut V,
     name: &'ast ObjectName,
     alias: Option<&'ast TableAlias>,
-    args: &'ast [Expr],
+    args: &'ast [FunctionArg],
     with_hints: &'ast [Expr],
 ) {
     visitor.visit_object_name(name);
-    for expr in args {
+    for arg in args {
+        let expr = match arg {
+            FunctionArg::Named { arg, .. } => arg,
+            FunctionArg::Unnamed(arg) => arg,
+        };
         visitor.visit_expr(expr);
     }
     if let Some(alias) = alias {
@@ -652,6 +754,7 @@ pub fn visit_join_constraint<'ast, V: Visit<'ast> + ?Sized>(
             }
         }
         JoinConstraint::Natural => (),
+        JoinConstraint::None => (),
     }
 }
 
@@ -680,6 +783,7 @@ pub fn visit_set_expr<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, set_expr: 
             right,
             all,
         } => visitor.visit_set_operation(left, op, right, *all),
+        SetExpr::Insert(stmt) => visitor.visit_statement(stmt),
     }
 }
 
@@ -748,6 +852,29 @@ pub fn visit_expr<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, expr: &'ast Ex
         ),
         Expr::Exists(query) => visitor.visit_exists(query),
         Expr::Subquery(query) => visitor.visit_subquery(query),
+        Expr::TryCast { expr, .. } => visitor.visit_expr(expr),
+        Expr::Substring {
+            expr,
+            substring_for,
+            substring_from,
+        } => {
+            visitor.visit_expr(expr);
+            if let Some(for_expr) = substring_for {
+                visitor.visit_expr(for_expr);
+            }
+            if let Some(from_expr) = substring_from {
+                visitor.visit_expr(from_expr);
+            }
+        }
+        Expr::Trim { expr, trim_where } => {
+            visitor.visit_expr(expr);
+            if let Some(trim_where_expr) = trim_where {
+                visitor.visit_expr(&trim_where_expr.1);
+            }
+        }
+        Expr::TypedString { .. } => {}
+        Expr::MapAccess { column, .. } => visitor.visit_expr(column),
+        Expr::ListAgg { .. } => {}
     }
 }
 
@@ -887,7 +1014,11 @@ pub fn visit_nested<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, expr: &'ast 
 pub fn visit_function<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, func: &'ast Function) {
     visitor.visit_object_name(&func.name);
     for arg in &func.args {
-        visitor.visit_expr(arg);
+        let expr = match arg {
+            FunctionArg::Named { arg, .. } => arg,
+            FunctionArg::Unnamed(arg) => arg,
+        };
+        visitor.visit_expr(expr);
     }
     if let Some(over) = &func.over {
         visitor.visit_window_spec(over);
@@ -954,12 +1085,16 @@ pub fn visit_insert<'ast, V: Visit<'ast> + ?Sized>(
     table_name: &'ast ObjectName,
     columns: &'ast [Ident],
     source: &'ast Query,
+    partitioned: &'ast Option<Vec<Expr>>
 ) {
     visitor.visit_object_name(table_name);
     for column in columns {
         visitor.visit_ident(column);
     }
     visitor.visit_query(source);
+    if let Some(part) = partitioned {
+        visitor.visit_partitions(part);
+    }
 }
 
 pub fn visit_values<'ast, V: Visit<'ast> + ?Sized>(visitor: &mut V, values: &'ast Values) {
@@ -1070,6 +1205,7 @@ pub fn visit_create_table<'ast, V: Visit<'ast> + ?Sized>(
     _external: bool,
     file_format: &'ast Option<FileFormat>,
     location: &'ast Option<String>,
+    query: &'ast Option<Box<Query>>,
 ) {
     visitor.visit_object_name(name);
     for column in columns {
@@ -1086,6 +1222,9 @@ pub fn visit_create_table<'ast, V: Visit<'ast> + ?Sized>(
     }
     if let Some(location) = location {
         visitor.visit_literal_string(location);
+    }
+    if let Some(query) = query {
+        visitor.visit_query(query);
     }
 }
 
@@ -1120,12 +1259,14 @@ pub fn visit_column_option<'ast, V: Visit<'ast> + ?Sized>(
         ColumnOption::ForeignKey {
             foreign_table,
             referred_columns,
+            ..
         } => {
             visitor.visit_object_name(foreign_table);
             for column in referred_columns {
                 visitor.visit_ident(column);
             }
         }
+        ColumnOption::DialectSpecific(_) => {}
     }
 }
 
@@ -1152,6 +1293,35 @@ pub fn visit_alter_table_operation<'ast, V: Visit<'ast> + ?Sized>(
             visitor.visit_alter_add_constraint(table_constraint)
         }
         AlterTableOperation::DropConstraint { name } => visitor.visit_alter_drop_constraint(name),
+        AlterTableOperation::AddColumn { column_def } => visitor.visit_alter_add_column(column_def),
+        AlterTableOperation::DropColumn {
+            column_name,
+            if_exists,
+            cascade,
+        } => visitor.visit_alter_drop_column(column_name, if_exists, cascade),
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => visitor.visit_alter_rename_column(old_column_name, new_column_name),
+        AlterTableOperation::RenamePartitions {
+            old_partitions,
+            new_partitions,
+        } => visitor.visit_alter_rename_partitions(old_partitions, new_partitions),
+        AlterTableOperation::AddPartitions {
+            if_not_exists,
+            new_partitions,
+        } => {
+            visitor.visit_alter_add_partitions(if_not_exists, new_partitions);
+        }
+        AlterTableOperation::DropPartitions {
+            partitions,
+            if_exists,
+        } => {
+            visitor.visit_alter_drop_partitions(if_exists, partitions);
+        }
+        AlterTableOperation::RenameTable { table_name } => {
+            visitor.visit_alter_rename_table(table_name)
+        }
     }
 }
 
@@ -1177,6 +1347,7 @@ pub fn visit_table_constraint<'ast, V: Visit<'ast> + ?Sized>(
             columns,
             foreign_table,
             referred_columns,
+            ..
         } => visitor.visit_table_constraint_foreign_key(
             name.as_ref(),
             columns,
@@ -1238,6 +1409,72 @@ pub fn visit_alter_drop_constraint<'ast, V: Visit<'ast> + ?Sized>(
     name: &'ast Ident,
 ) {
     visitor.visit_ident(name);
+}
+
+pub fn visit_alter_add_column<'ast, V: Visit<'ast> + ?Sized>(
+    visitor: &mut V,
+    column_def: &'ast ColumnDef,
+) {
+    visitor.visit_column_def(column_def);
+}
+
+pub fn visit_alter_drop_column<'ast, V: Visit<'ast> + ?Sized>(
+    visitor: &mut V,
+    column_name: &'ast Ident,
+    _: &bool,
+    _: &bool,
+) {
+    visitor.visit_ident(column_name);
+}
+
+pub fn visit_alter_rename_column<'ast, V: Visit<'ast> + ?Sized>(
+    visitor: &mut V,
+    old_column_name: &'ast Ident,
+    new_column_name: &'ast Ident,
+) {
+    visitor.visit_ident(old_column_name);
+    visitor.visit_ident(new_column_name);
+}
+
+pub fn visit_partitions<'ast, V: Visit<'ast> + ?Sized>(
+    visitor: &mut V,
+    partitions: &'ast Vec<Expr>,
+) {
+    for expr in partitions {
+        visitor.visit_expr(expr);
+    }
+}
+
+pub fn visit_alter_rename_partitions<'ast, V: Visit<'ast> + ?Sized>(
+    visitor: &mut V,
+    old_partitions: &'ast Vec<Expr>,
+    new_partitions: &'ast Vec<Expr>,
+) {
+    visitor.visit_partitions(old_partitions);
+    visitor.visit_partitions(new_partitions);
+}
+
+pub fn visit_alter_add_partitions<'ast, V: Visit<'ast> + ?Sized>(
+    visitor: &mut V,
+    _: &'ast bool,
+    new_partitions: &'ast Vec<Expr>,
+) {
+    visitor.visit_partitions(new_partitions);
+}
+
+pub fn visit_alter_drop_partitions<'ast, V: Visit<'ast> + ?Sized>(
+    visitor: &mut V,
+    _: &'ast bool,
+    partitions: &'ast Vec<Expr>,
+) {
+    visitor.visit_partitions(partitions);
+}
+
+pub fn visit_alter_rename_table<'ast, V: Visit<'ast> + ?Sized>(
+    visitor: &mut V,
+    table_name: &'ast ObjectName,
+) {
+    visitor.visit_object_name(table_name);
 }
 
 pub fn visit_start_transaction<'ast, V: Visit<'ast> + ?Sized>(
